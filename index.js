@@ -1,10 +1,12 @@
 /**
- * Bot Xì Dách Nhiều Người (Multiplayer Blackjack) — v3.1
+ * Bot Xì Dách Nhiều Người (Multiplayer Blackjack) — v3.2
  * - Tối đa 6 người / phòng
  * - Bài ẩn hoàn toàn cho đến khi kết thúc
  * - Sau khi rút bài, tự động hiện bài mới (ephemeral) — không cần bấm "Xem bài" lại
  * - /diemdanh nhận 20,000 coins mỗi ngày
  * - Lượt chơi tuần tự: Rút thêm / Dằn / Bỏ lượt
+ * - Tối đa 5 lá / người
+ * - Ngũ Linh: rút đủ 5 lá mà tổng ≤ 21 → thắng x5 tiền cược
  */
 
 const {
@@ -105,6 +107,7 @@ const STATUS_LABEL = {
   stand:     '✋ Đã dằn',
   bust:      '💥 Quắc',
   blackjack: '✨ Blackjack',
+  ngulinh:   '🌟 Ngũ Linh (x5)',
   fold:      '🚪 Bỏ lượt',
 };
 
@@ -148,7 +151,10 @@ function resultEmbed(room) {
     const pVal = handValue(p.cards);
     const pBJ  = isBlackjack(p.cards);
     let outcome;
-    if (p.status === 'bust' || p.status === 'fold') {
+    if (p.status === 'ngulinh') {
+      const gain = p.bet * 5;
+      outcome = `🌟 Ngũ Linh (5 lá ≤ 21) — Thắng **${gain.toLocaleString()}** coins (x5)!`;
+    } else if (p.status === 'bust' || p.status === 'fold') {
       outcome = `❌ ${p.status === 'fold' ? 'Bỏ lượt' : 'Quắc'} — Thua ${p.bet.toLocaleString()} coins`;
     } else if (pBJ && dBJ) {
       outcome = '🤝 Cả hai Blackjack — Hòa';
@@ -218,6 +224,7 @@ function resolveRoom(room) {
 
   for (const p of room.players) {
     if (p.status === 'bust' || p.status === 'fold') continue; // already deducted
+    if (p.status === 'ngulinh') continue; // already paid out x5 at draw time
     const pVal = handValue(p.cards);
     const pBJ  = isBlackjack(p.cards);
     if (pBJ && dBJ)     { /* hòa — không đổi */ }
@@ -469,12 +476,23 @@ async function handleInteraction(interaction) {
     if (!cur || cur.id !== userId || cur.status !== 'playing')
       return safeReply(interaction, { content: '❌ Chưa đến lượt bạn!', ephemeral: true });
 
+    // Giới hạn tối đa 5 lá
+    if (cur.cards.length >= 5) {
+      return safeReply(interaction, { content: '❌ Đã đạt tối đa 5 lá!', ephemeral: true });
+    }
+
     cur.cards.push(room.deck.pop());
     const val = handValue(cur.cards);
 
     if (val > 21) {
       cur.status = 'bust';
       addBalance(userId, -cur.bet);
+      return advanceTurn(interaction, room);
+    }
+    // Ngũ Linh: rút đủ 5 lá mà tổng ≤ 21 → thắng x5 tiền cược
+    if (cur.cards.length === 5 && val <= 21) {
+      cur.status = 'ngulinh';
+      addBalance(userId, cur.bet * 5); // thắng x5
       return advanceTurn(interaction, room);
     }
     if (val === 21) {
