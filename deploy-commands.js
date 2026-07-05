@@ -25,6 +25,10 @@ const commands = [
     .setName('xidach')
     .setDescription('🃏 Chơi game Xì Dách (Blackjack) với cược coins')
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName('diemdanh')
+    .setDescription('📅 Điểm danh hàng ngày nhận 20,000 coins')
+    .toJSON(),
 ];
 
 const rest = new REST({ version: '10' }).setToken(token);

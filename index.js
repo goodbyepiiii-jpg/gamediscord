@@ -1,8 +1,9 @@
 /**
- * Bot Xì Dách Nhiều Người (Multiplayer Blackjack) — v3.0
+ * Bot Xì Dách Nhiều Người (Multiplayer Blackjack) — v3.1
  * - Tối đa 6 người / phòng
  * - Bài ẩn hoàn toàn cho đến khi kết thúc
- * - Mỗi người tự xem bài riêng qua nút "Xem bài" (ephemeral)
+ * - Sau khi rút bài, tự động hiện bài mới (ephemeral) — không cần bấm "Xem bài" lại
+ * - /diemdanh nhận 20,000 coins mỗi ngày
  * - Lượt chơi tuần tự: Rút thêm / Dằn / Bỏ lượt
  */
 
@@ -23,8 +24,9 @@ process.on('uncaughtException',  err => console.error('[uncaughtException]',  er
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 // ─── Storage ───────────────────────────────────────────────────────────────
-const rooms    = new Map(); // channelId → room
-const balances = new Map(); // userId → coins
+const rooms       = new Map(); // channelId → room
+const balances    = new Map(); // userId → coins
+const lastCheckIn = new Map(); // userId → 'YYYY-MM-DD'
 
 // ─── Card helpers ──────────────────────────────────────────────────────────
 const SUITS = ['♠️', '♥️', '♦️', '♣️'];
@@ -290,6 +292,54 @@ client.on(Events.InteractionCreate, async interaction => {
 });
 
 async function handleInteraction(interaction) {
+  // ── /diemdanh ─────────────────────────────────────────────────────────────
+  if (interaction.isChatInputCommand() && interaction.commandName === 'diemdanh') {
+    const uid     = interaction.user.id;
+    const now     = new Date();
+    // Dùng giờ UTC+7 (Việt Nam) để tính ngày
+    const vnDate  = new Date(now.getTime() + 7 * 60 * 60 * 1000);
+    const today   = vnDate.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+    const last    = lastCheckIn.get(uid);
+
+    if (last === today) {
+      // Tính giờ còn lại đến nửa đêm (UTC+7)
+      const midnight = new Date(vnDate);
+      midnight.setUTCHours(17, 0, 0, 0); // 17:00 UTC = 00:00 UTC+7 hôm sau
+      if (midnight <= vnDate) midnight.setUTCDate(midnight.getUTCDate() + 1);
+      const msLeft = midnight - now;
+      const h = Math.floor(msLeft / 3_600_000);
+      const m = Math.floor((msLeft % 3_600_000) / 60_000);
+      return interaction.reply({
+        ephemeral: true,
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('📅 Điểm danh')
+            .setDescription(`Bạn đã điểm danh hôm nay rồi!\nQuay lại sau **${h} giờ ${m} phút** nhé.`)
+            .setColor(0xED4245)
+            .setFooter({ text: `💰 Số dư: ${getBalance(uid).toLocaleString()} coins` }),
+        ],
+      });
+    }
+
+    const REWARD = 20_000;
+    lastCheckIn.set(uid, today);
+    addBalance(uid, REWARD);
+
+    return interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('📅 Điểm danh thành công!')
+          .setDescription(`**${interaction.user.username}** nhận được **${REWARD.toLocaleString()} coins**! 🎉`)
+          .setColor(0x57F287)
+          .addFields(
+            { name: '💰 Số dư hiện tại', value: `**${getBalance(uid).toLocaleString()}** coins`, inline: true },
+          )
+          .setFooter({ text: 'Quay lại điểm danh vào ngày mai!' })
+          .setTimestamp(),
+      ],
+    });
+  }
+
   // ── /xidach ───────────────────────────────────────────────────────────────
   if (interaction.isChatInputCommand() && interaction.commandName === 'xidach') {
     const chId = interaction.channelId;
@@ -456,12 +506,61 @@ async function handleInteraction(interaction) {
     if (val > 21) {
       cur.status = 'bust';
       addBalance(userId, -cur.bet);
+      // Hiện bài cuối (quắc) trước khi chuyển lượt
+      try {
+        await interaction.followUp({
+          ephemeral: true,
+          embeds: [
+            new EmbedBuilder()
+              .setTitle('💥 Quắc rồi!')
+              .setColor(0xED4245)
+              .addFields(
+                { name: '🃏 Bài của bạn', value: handStr(cur.cards), inline: true },
+                { name: '📊 Tổng',        value: `**${val}**`,       inline: true },
+              )
+              .setFooter({ text: 'Chỉ mình bạn thấy.' }),
+          ],
+        });
+      } catch (_) {}
       return advanceTurn(interaction, room);
     }
     if (val === 21) {
       cur.status = 'stand'; // tự động dằn khi đạt 21
+      try {
+        await interaction.followUp({
+          ephemeral: true,
+          embeds: [
+            new EmbedBuilder()
+              .setTitle('🎯 Đúng 21 — Tự động dằn!')
+              .setColor(0x57F287)
+              .addFields(
+                { name: '🃏 Bài của bạn', value: handStr(cur.cards), inline: true },
+                { name: '📊 Tổng',        value: `**${val}**`,       inline: true },
+              )
+              .setFooter({ text: 'Chỉ mình bạn thấy.' }),
+          ],
+        });
+      } catch (_) {}
       return advanceTurn(interaction, room);
     }
+
+    // Vẫn đang chơi — tự động hiện bài mới (không cần bấm "Xem bài" lại)
+    try {
+      await interaction.followUp({
+        ephemeral: true,
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('🃏 Bài của bạn (sau khi rút)')
+            .setColor(0x5865F2)
+            .addFields(
+              { name: '🃏 Lá bài',    value: handStr(cur.cards), inline: true },
+              { name: '📊 Tổng điểm', value: `**${val}**`,       inline: true },
+              { name: '🤖 Lá lộ Bot', value: cardStr(room.dealerCards[0]), inline: false },
+            )
+            .setFooter({ text: 'Chỉ mình bạn thấy.' }),
+        ],
+      });
+    } catch (_) {}
 
     return safeUpdate(interaction, { embeds: [gameEmbed(room)], components: gameRows(cur.id) });
   }
