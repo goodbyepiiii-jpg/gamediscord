@@ -1,0 +1,10 @@
+services:
+  - type: worker          # Background Worker — không cần port HTTP
+    name: discord-xidach-bot
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false       # Bạn tự điền trên dashboard Render
+    autoDeploy: true      # Tự deploy khi push lên GitHub
