@@ -1,15 +1,18 @@
 /**
  * deploy-commands.js
- * Chạy file này MỘT LẦN để đăng ký slash command /xidach lên Discord.
- * 
+ * Đăng ký slash command /xidach lên Discord (global).
+ * Đồng thời xóa toàn bộ guild commands cũ nếu có GUILD_ID.
+ *
  * Cách dùng:
  *   DISCORD_TOKEN=xxx CLIENT_ID=yyy node deploy-commands.js
+ *   DISCORD_TOKEN=xxx CLIENT_ID=yyy GUILD_ID=zzz node deploy-commands.js
  */
 
 const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 
 const token    = process.env.DISCORD_TOKEN;
 const clientId = process.env.CLIENT_ID;
+const guildId  = process.env.GUILD_ID;
 
 if (!token || !clientId) {
   console.error('❌ Cần đặt biến môi trường DISCORD_TOKEN và CLIENT_ID');
@@ -28,9 +31,17 @@ const rest = new REST({ version: '10' }).setToken(token);
 
 (async () => {
   try {
-    console.log('⏳ Đang đăng ký slash commands...');
+    // 1. Đăng ký global commands
+    console.log('⏳ Đang đăng ký global slash commands...');
     await rest.put(Routes.applicationCommands(clientId), { body: commands });
-    console.log('✅ Đăng ký thành công! Slash command /xidach đã sẵn sàng.');
+    console.log('✅ Đăng ký global thành công!');
+
+    // 2. Xóa guild commands cũ (nếu có GUILD_ID)
+    if (guildId) {
+      console.log(`⏳ Đang xóa guild commands cũ trong server ${guildId}...`);
+      await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: [] });
+      console.log('✅ Đã xóa toàn bộ guild commands cũ.');
+    }
   } catch (err) {
     console.error('❌ Lỗi:', err.message);
   }
