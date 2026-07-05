@@ -111,16 +111,17 @@ const STATUS_LABEL = {
 function gameEmbed(room) {
   const cur    = curTurn(room);
   const fields = room.players.map(p => {
-    const hidden = Array(p.cards.length).fill(HIDDEN).join(' ');
+    const val    = handValue(p.cards);
     const status = p.id === cur?.id && p.status === 'playing'
       ? '👉 **Đến lượt bạn**'
       : STATUS_LABEL[p.status] ?? '';
     return {
       name:   (p.id === cur?.id ? '▶️ ' : '') + `${p.username} · 🎯 ${p.bet.toLocaleString()} coins`,
-      value:  `${hidden}\n${status}`,
+      value:  `${handStr(p.cards)}\n> Tổng: **${val}**\n${status}`,
       inline: true,
     };
   });
+  // Lá bot: hiện lá đầu, ẩn lá sau (dealer chưa lộ hết)
   fields.push({
     name:   '🤖 Bot (Dealer)',
     value:  `${cardStr(room.dealerCards[0])} ${HIDDEN}`,
@@ -197,17 +198,11 @@ function bettingRows(currentPlayerId) {
       .setStyle(ButtonStyle.Primary)
       .setDisabled(bal < b)
   );
-  return [
-    new ActionRowBuilder().addComponents(...btns),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('mp_view').setLabel('👁️ Xem bài').setStyle(ButtonStyle.Secondary),
-    ),
-  ];
+  return [new ActionRowBuilder().addComponents(...btns)];
 }
 
 function gameRows(currentPlayerId) {
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('mp_view').setLabel('👁️ Xem bài').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`mp_hit_${currentPlayerId}`).setLabel('🃏 Rút thêm').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`mp_stand_${currentPlayerId}`).setLabel('✋ Dằn').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`mp_fold_${currentPlayerId}`).setLabel('🚪 Bỏ lượt').setStyle(ButtonStyle.Danger),
@@ -463,32 +458,6 @@ async function handleInteraction(interaction) {
     }
   }
 
-  // ── Xem bài (ephemeral, bất kỳ người chơi nào) ────────────────────────────
-  if (cid === 'mp_view') {
-    if (!room || !['betting','playing'].includes(room.phase))
-      return safeReply(interaction, { content: '❌ Không có game đang chạy.', ephemeral: true });
-
-    const p = getPlayer(room, userId);
-    if (!p)
-      return safeReply(interaction, { content: '❌ Bạn không ở trong game này.', ephemeral: true });
-
-    const val = handValue(p.cards);
-    return safeReply(interaction, {
-      ephemeral: true,
-      embeds: [
-        new EmbedBuilder()
-          .setTitle('👁️ Bài của bạn — chỉ mình bạn thấy')
-          .setColor(0x5865F2)
-          .addFields(
-            { name: '🃏 Lá bài',    value: handStr(p.cards) + (isBlackjack(p.cards) ? '  ✨ **BLACKJACK!**' : ''), inline: true },
-            { name: '📊 Tổng điểm', value: `**${val}**`, inline: true },
-            { name: '🤖 Lá lộ Bot', value: cardStr(room.dealerCards[0]), inline: false },
-          )
-          .setFooter({ text: 'Chỉ mình bạn thấy tin nhắn này.' }),
-      ],
-    });
-  }
-
   // ── Rút thêm ──────────────────────────────────────────────────────────────
   if (cid.startsWith('mp_hit_')) {
     if (!room || room.phase !== 'playing') return;
@@ -506,61 +475,12 @@ async function handleInteraction(interaction) {
     if (val > 21) {
       cur.status = 'bust';
       addBalance(userId, -cur.bet);
-      // Hiện bài cuối (quắc) trước khi chuyển lượt
-      try {
-        await interaction.followUp({
-          ephemeral: true,
-          embeds: [
-            new EmbedBuilder()
-              .setTitle('💥 Quắc rồi!')
-              .setColor(0xED4245)
-              .addFields(
-                { name: '🃏 Bài của bạn', value: handStr(cur.cards), inline: true },
-                { name: '📊 Tổng',        value: `**${val}**`,       inline: true },
-              )
-              .setFooter({ text: 'Chỉ mình bạn thấy.' }),
-          ],
-        });
-      } catch (_) {}
       return advanceTurn(interaction, room);
     }
     if (val === 21) {
       cur.status = 'stand'; // tự động dằn khi đạt 21
-      try {
-        await interaction.followUp({
-          ephemeral: true,
-          embeds: [
-            new EmbedBuilder()
-              .setTitle('🎯 Đúng 21 — Tự động dằn!')
-              .setColor(0x57F287)
-              .addFields(
-                { name: '🃏 Bài của bạn', value: handStr(cur.cards), inline: true },
-                { name: '📊 Tổng',        value: `**${val}**`,       inline: true },
-              )
-              .setFooter({ text: 'Chỉ mình bạn thấy.' }),
-          ],
-        });
-      } catch (_) {}
       return advanceTurn(interaction, room);
     }
-
-    // Vẫn đang chơi — tự động hiện bài mới (không cần bấm "Xem bài" lại)
-    try {
-      await interaction.followUp({
-        ephemeral: true,
-        embeds: [
-          new EmbedBuilder()
-            .setTitle('🃏 Bài của bạn (sau khi rút)')
-            .setColor(0x5865F2)
-            .addFields(
-              { name: '🃏 Lá bài',    value: handStr(cur.cards), inline: true },
-              { name: '📊 Tổng điểm', value: `**${val}**`,       inline: true },
-              { name: '🤖 Lá lộ Bot', value: cardStr(room.dealerCards[0]), inline: false },
-            )
-            .setFooter({ text: 'Chỉ mình bạn thấy.' }),
-        ],
-      });
-    } catch (_) {}
 
     return safeUpdate(interaction, { embeds: [gameEmbed(room)], components: gameRows(cur.id) });
   }
