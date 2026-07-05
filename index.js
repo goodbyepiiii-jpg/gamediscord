@@ -1,7 +1,7 @@
 /**
- * Bot Xì Dách (Blackjack) Discord — v2.1
+ * Bot Xì Dách (Blackjack) Discord — v2.2
  * Features: lobby, cược, ẩn bài, xem bài, rút thêm, dừng
- * Fixes: race-condition lock, dealer BJ check, owner-in-customId
+ * Fixes: crash prevention, error handling, reconnect
  */
 
 const {
@@ -13,6 +13,15 @@ const {
   Events,
   EmbedBuilder,
 } = require('discord.js');
+
+// ─── Crash prevention ──────────────────────────────────────────────────────
+process.on('unhandledRejection', (err) => {
+  console.error('[unhandledRejection]', err?.message ?? err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err?.message ?? err);
+  // Không exit — bot tiếp tục chạy
+});
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -61,13 +70,10 @@ function getBalance(userId) {
   return balances.get(userId);
 }
 function addBalance(userId, delta) {
-  const cur = getBalance(userId);
-  balances.set(userId, Math.max(0, cur + delta));
+  balances.set(userId, Math.max(0, getBalance(userId) + delta));
 }
 
 // ─── Race-condition guard ──────────────────────────────────────────────────
-// Atomically transitions game from 'playing' → 'resolving'.
-// Returns true if we got the lock (first caller), false otherwise.
 function acquireResolveLock(userId) {
   const game = games.get(userId);
   if (!game || game.phase !== 'playing') return false;
@@ -75,35 +81,20 @@ function acquireResolveLock(userId) {
   return true;
 }
 
-// ─── Owner helpers ─────────────────────────────────────────────────────────
-// We embed the ownerId in every customId so ownership is verifiable without
-// relying on Discord interactionMetadata (which can be unavailable).
+// ─── Owner in customId ────────────────────────────────────────────────────
 const SEP = '_';
-
 function makeId(action, userId, extra) {
-  // e.g. "bj_start_123456" or "bj_bet_500_123456"
   return extra !== undefined
     ? `bj${SEP}${action}${SEP}${extra}${SEP}${userId}`
     : `bj${SEP}${action}${SEP}${userId}`;
 }
-
-// Parse a customId. Returns { action, ownerId, extra? } or null.
 function parseId(customId) {
   if (!customId.startsWith('bj_')) return null;
   const parts = customId.split(SEP);
-  // parts[0] = 'bj'
   const action = parts[1];
   if (!action) return null;
-
-  if (action === 'bet') {
-    // bj_bet_<amount>_<ownerId>
-    const extra = parts[2];
-    const ownerId = parts[3];
-    return { action, extra, ownerId };
-  }
-  // bj_<action>_<ownerId>   (start, cancel, view, hit, stand)
-  const ownerId = parts[2];
-  return { action, ownerId };
+  if (action === 'bet') return { action, extra: parts[2], ownerId: parts[3] };
+  return { action, ownerId: parts[2] };
 }
 
 // ─── Embeds ────────────────────────────────────────────────────────────────
@@ -133,13 +124,12 @@ function gameEmbed(game) {
   const pVal  = handValue(game.playerCards);
   const pHand = game.playerCards.map(cardStr).join(' ');
   const bFirst = cardStr(game.botCards[0]);
-
   return new EmbedBuilder()
     .setTitle('🃏 Xì Dách — Đang chơi')
     .setColor(0x2B2D31)
     .addFields(
       { name: '👤 Bài của bạn', value: `${pHand}\n> **Tổng: ${pVal}**`, inline: true },
-      { name: '🤖 Bài của Bot',  value: `${bFirst} \`🂠\`\n> **Tổng: ?**`,     inline: true },
+      { name: '🤖 Bài của Bot',  value: `${bFirst} \`🂠\`\n> **Tổng: ?**`, inline: true },
     )
     .addFields({ name: '💰 Cược', value: `**${game.bet.toLocaleString()}** coins`, inline: false })
     .setFooter({ text: '👁️ Xem bài để kiểm tra lá bài của bạn (chỉ mình thấy).' });
@@ -150,10 +140,7 @@ function resultEmbed(game, result, payout) {
   const bVal  = handValue(game.botCards);
   const pHand = game.playerCards.map(cardStr).join(' ');
   const bHand = game.botCards.map(cardStr).join(' ');
-
-  const colorMap = { win: 0x57F287, blackjack: 0x57F287, botbust: 0x57F287,
-                     lose: 0xED4245, bust: 0xED4245, dealerbj: 0xED4245,
-                     tie: 0x808080 };
+  const colorMap = { win:0x57F287, blackjack:0x57F287, botbust:0x57F287, lose:0xED4245, bust:0xED4245, dealerbj:0xED4245, tie:0x808080 };
   const textMap  = {
     blackjack: `✨ **BLACKJACK! Bạn thắng!** +${payout.toLocaleString()} coins`,
     win:       `🏆 **Bạn thắng!** +${payout.toLocaleString()} coins`,
@@ -163,7 +150,6 @@ function resultEmbed(game, result, payout) {
     dealerbj:  `🃏 **Bot Blackjack! Bạn thua!** -${game.bet.toLocaleString()} coins`,
     tie:       `🤝 **Hòa!** Hoàn trả ${game.bet.toLocaleString()} coins`,
   };
-
   return new EmbedBuilder()
     .setTitle('🃏 Xì Dách — Kết quả')
     .setColor(colorMap[result] ?? 0x808080)
@@ -172,9 +158,9 @@ function resultEmbed(game, result, payout) {
       { name: '🤖 Bot', value: `${bHand}\n> **Tổng: ${bVal}**`, inline: true },
     )
     .addFields(
-      { name: '💰 Cược',     value: `${game.bet.toLocaleString()} coins`,                inline: true  },
-      { name: '📊 Kết quả', value: textMap[result] ?? '—',                               inline: false },
-      { name: '🏦 Số dư',   value: `**${getBalance(game.ownerId).toLocaleString()}** coins`, inline: true },
+      { name: '💰 Cược',     value: `${game.bet.toLocaleString()} coins`,                    inline: true  },
+      { name: '📊 Kết quả', value: textMap[result] ?? '—',                                   inline: false },
+      { name: '🏦 Số dư',   value: `**${getBalance(game.ownerId).toLocaleString()}** coins`, inline: true  },
     )
     .setTimestamp();
 }
@@ -188,7 +174,6 @@ function lobbyRow(userId) {
     new ButtonBuilder().setCustomId(makeId('cancel', userId)).setLabel('❌ Huỷ'    ).setStyle(ButtonStyle.Danger),
   );
 }
-
 function betRows(userId) {
   const bal  = getBalance(userId);
   const btns = BETS.map(b =>
@@ -205,7 +190,6 @@ function betRows(userId) {
     ),
   ];
 }
-
 function gameRow(userId) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(makeId('view',  userId)).setLabel('👁️ Xem bài' ).setStyle(ButtonStyle.Secondary),
@@ -216,24 +200,44 @@ function gameRow(userId) {
 
 // ─── Result helpers ────────────────────────────────────────────────────────
 function applyResult(userId, result, bet, payout) {
-  if (result === 'win' || result === 'blackjack' || result === 'botbust') addBalance(userId, payout);
-  else if (result === 'lose' || result === 'bust' || result === 'dealerbj') addBalance(userId, -bet);
-  // tie: no change
+  if (['win','blackjack','botbust'].includes(result)) addBalance(userId, payout);
+  else if (['lose','bust','dealerbj'].includes(result)) addBalance(userId, -bet);
 }
 
-// ─── Bot stand logic ───────────────────────────────────────────────────────
 function resolveGame(game) {
   const pVal = handValue(game.playerCards);
   while (handValue(game.botCards) < 17) game.botCards.push(game.deck.pop());
   const bVal = handValue(game.botCards);
+  if (bVal > 21)        return { result: 'botbust', payout: game.bet };
+  if (pVal > bVal)      return { result: 'win',     payout: game.bet };
+  if (pVal < bVal)      return { result: 'lose',    payout: 0 };
+  return { result: 'tie', payout: 0 };
+}
 
-  let result, payout = 0;
-  if (bVal > 21)       { result = 'botbust'; payout = game.bet; }
-  else if (pVal > bVal){ result = 'win';     payout = game.bet; }
-  else if (pVal < bVal){ result = 'lose'; }
-  else                 { result = 'tie'; }
+// ─── Safe reply helper ─────────────────────────────────────────────────────
+// Tránh crash khi interaction đã expired hoặc đã được reply rồi
+async function safeUpdate(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(payload).catch(() => {});
+    } else {
+      await interaction.update(payload);
+    }
+  } catch (err) {
+    console.error('[safeUpdate]', err?.message ?? err);
+  }
+}
 
-  return { result, payout };
+async function safeReply(interaction, payload) {
+  try {
+    if (interaction.replied) {
+      await interaction.followUp({ ...payload, ephemeral: true }).catch(() => {});
+    } else {
+      await interaction.reply(payload);
+    }
+  } catch (err) {
+    console.error('[safeReply]', err?.message ?? err);
+  }
 }
 
 // ─── Event handler ─────────────────────────────────────────────────────────
@@ -241,8 +245,22 @@ client.once(Events.ClientReady, () => {
   console.log(`✅ Đã đăng nhập: ${client.user.tag}`);
 });
 
-client.on(Events.InteractionCreate, async interaction => {
+client.on(Events.InteractionCreate, async (interaction) => {
+  // Bọc toàn bộ trong try/catch — không bao giờ crash process
+  try {
+    await handleInteraction(interaction);
+  } catch (err) {
+    console.error('[InteractionCreate]', err?.message ?? err);
+    // Cố trả lỗi về user nhưng không crash nếu thất bại
+    try {
+      const msg = { content: '❌ Có lỗi xảy ra, thử lại sau.', ephemeral: true };
+      if (interaction.replied || interaction.deferred) await interaction.followUp(msg).catch(() => {});
+      else await interaction.reply(msg).catch(() => {});
+    } catch (_) {}
+  }
+});
 
+async function handleInteraction(interaction) {
   // ── /xidach ──────────────────────────────────────────────────────────────
   if (interaction.isChatInputCommand() && interaction.commandName === 'xidach') {
     games.delete(interaction.user.id);
@@ -256,42 +274,39 @@ client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isButton()) return;
 
   const parsed = parseId(interaction.customId);
-  if (!parsed) return; // not our button
+  if (!parsed) return;
 
   const { action, ownerId, extra } = parsed;
   const userId = interaction.user.id;
 
-  // ── Owner check — hardcoded in customId ──────────────────────────────────
+  // ── Owner check ──────────────────────────────────────────────────────────
   if (ownerId && ownerId !== userId) {
-    return interaction.reply({ content: '❌ Đây không phải game của bạn!', ephemeral: true });
+    return safeReply(interaction, { content: '❌ Đây không phải game của bạn!', ephemeral: true });
   }
 
   // ── Bắt đầu ──────────────────────────────────────────────────────────────
   if (action === 'start') {
-    await interaction.update({
+    return safeUpdate(interaction, {
       embeds:     [betEmbed(interaction.user)],
       components: betRows(userId),
     });
-    return;
   }
 
   // ── Huỷ ──────────────────────────────────────────────────────────────────
   if (action === 'cancel') {
     games.delete(userId);
-    await interaction.update({
-      embeds: [new EmbedBuilder().setTitle('🃏 Xì Dách').setDescription('Đã huỷ phòng.').setColor(0x808080)],
+    return safeUpdate(interaction, {
+      embeds:     [new EmbedBuilder().setTitle('🃏 Xì Dách').setDescription('Đã huỷ phòng.').setColor(0x808080)],
       components: [],
     });
-    return;
   }
 
   // ── Đặt cược ─────────────────────────────────────────────────────────────
   if (action === 'bet') {
     const bet = parseInt(extra, 10);
     const bal = getBalance(userId);
-
     if (isNaN(bet) || bal < bet) {
-      return interaction.reply({ content: '❌ Số dư không đủ hoặc mức cược không hợp lệ!', ephemeral: true });
+      return safeReply(interaction, { content: '❌ Số dư không đủ!', ephemeral: true });
     }
 
     const deck        = createDeck();
@@ -300,51 +315,44 @@ client.on(Events.InteractionCreate, async interaction => {
     const game        = { phase: 'playing', ownerId: userId, bet, deck, playerCards, botCards };
     games.set(userId, game);
 
-    // ── Natural blackjack checks (immediate resolution) ──────────────────
     const playerBJ = isBlackjack(playerCards);
     const botBJ    = isBlackjack(botCards);
 
     if (playerBJ && botBJ) {
-      // Both blackjack → tie
       games.delete(userId);
-      return interaction.update({ embeds: [resultEmbed(game, 'tie', 0)], components: [] });
+      return safeUpdate(interaction, { embeds: [resultEmbed(game, 'tie', 0)], components: [] });
     }
     if (playerBJ) {
-      // Player blackjack wins 1.5×
       const payout = Math.floor(bet * 1.5);
       addBalance(userId, payout);
       games.delete(userId);
-      return interaction.update({ embeds: [resultEmbed(game, 'blackjack', payout)], components: [] });
+      return safeUpdate(interaction, { embeds: [resultEmbed(game, 'blackjack', payout)], components: [] });
     }
     if (botBJ) {
-      // Dealer blackjack — player loses immediately
       addBalance(userId, -bet);
       games.delete(userId);
-      return interaction.update({ embeds: [resultEmbed(game, 'dealerbj', 0)], components: [] });
+      return safeUpdate(interaction, { embeds: [resultEmbed(game, 'dealerbj', 0)], components: [] });
     }
 
-    await interaction.update({ embeds: [gameEmbed(game)], components: [gameRow(userId)] });
-    return;
+    return safeUpdate(interaction, { embeds: [gameEmbed(game)], components: [gameRow(userId)] });
   }
 
-  // ── Xem bài (ephemeral, no lock needed) ──────────────────────────────────
+  // ── Xem bài ──────────────────────────────────────────────────────────────
   if (action === 'view') {
     const game = games.get(userId);
     if (!game || game.phase === 'resolving') {
-      return interaction.reply({ content: '❌ Không có game đang chạy.', ephemeral: true });
+      return safeReply(interaction, { content: '❌ Không có game đang chạy.', ephemeral: true });
     }
-    const pVal  = handValue(game.playerCards);
-    const pHand = game.playerCards.map(cardStr).join(' ');
-    return interaction.reply({
+    return safeReply(interaction, {
       ephemeral: true,
       embeds: [
         new EmbedBuilder()
           .setTitle('👁️ Bài của bạn')
           .setColor(0x5865F2)
           .addFields(
-            { name: '🃏 Lá bài',    value: pHand,          inline: true },
-            { name: '📊 Tổng điểm', value: `**${pVal}**`,  inline: true },
-            { name: '🤖 Lá lộ Bot', value: cardStr(game.botCards[0]), inline: false },
+            { name: '🃏 Lá bài',    value: game.playerCards.map(cardStr).join(' '), inline: true },
+            { name: '📊 Tổng điểm', value: `**${handValue(game.playerCards)}**`,   inline: true },
+            { name: '🤖 Lá lộ Bot', value: cardStr(game.botCards[0]),               inline: false },
           )
           .setFooter({ text: 'Chỉ mình bạn thấy tin nhắn này.' }),
       ],
@@ -353,52 +361,46 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // ── Rút thêm ─────────────────────────────────────────────────────────────
   if (action === 'hit') {
-    // Acquire lock — rejects duplicate/concurrent clicks
     if (!acquireResolveLock(userId)) {
-      return interaction.reply({ content: '⏳ Đang xử lý...', ephemeral: true });
+      return safeReply(interaction, { content: '⏳ Đang xử lý...', ephemeral: true });
     }
     const game = games.get(userId);
-
     game.playerCards.push(game.deck.pop());
     const pVal = handValue(game.playerCards);
 
     if (pVal > 21) {
-      // Bust
-      addBalance(userId, -game.bet);
+      applyResult(userId, 'bust', game.bet, 0);
       games.delete(userId);
-      return interaction.update({ embeds: [resultEmbed(game, 'bust', 0)], components: [] });
+      return safeUpdate(interaction, { embeds: [resultEmbed(game, 'bust', 0)], components: [] });
     }
-
     if (pVal === 21) {
-      // Auto-stand at 21
       const { result, payout } = resolveGame(game);
       applyResult(userId, result, game.bet, payout);
       games.delete(userId);
-      return interaction.update({ embeds: [resultEmbed(game, result, payout)], components: [] });
+      return safeUpdate(interaction, { embeds: [resultEmbed(game, result, payout)], components: [] });
     }
 
-    // Still in play — release lock (set back to playing)
     game.phase = 'playing';
-    return interaction.update({ embeds: [gameEmbed(game)], components: [gameRow(userId)] });
+    return safeUpdate(interaction, { embeds: [gameEmbed(game)], components: [gameRow(userId)] });
   }
 
   // ── Dừng ─────────────────────────────────────────────────────────────────
   if (action === 'stand') {
     if (!acquireResolveLock(userId)) {
-      return interaction.reply({ content: '⏳ Đang xử lý...', ephemeral: true });
+      return safeReply(interaction, { content: '⏳ Đang xử lý...', ephemeral: true });
     }
     const game = games.get(userId);
     const { result, payout } = resolveGame(game);
     applyResult(userId, result, game.bet, payout);
     games.delete(userId);
-    return interaction.update({ embeds: [resultEmbed(game, result, payout)], components: [] });
+    return safeUpdate(interaction, { embeds: [resultEmbed(game, result, payout)], components: [] });
   }
-});
+}
 
 // ─── Login ─────────────────────────────────────────────────────────────────
 const token = process.env.DISCORD_TOKEN;
-if (!token || token === 'YOUR_BOT_TOKEN') {
-  console.error('❌ Thiếu DISCORD_TOKEN. Đặt biến môi trường DISCORD_TOKEN trước khi chạy.');
+if (!token) {
+  console.error('❌ Thiếu DISCORD_TOKEN. Đặt biến môi trường trước khi chạy.');
   process.exit(1);
 }
 client.login(token);
