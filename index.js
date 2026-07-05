@@ -1,6 +1,7 @@
 /**
- * Bot Xì Dách (Blackjack) Discord
+ * Bot Xì Dách (Blackjack) Discord — v2.1
  * Features: lobby, cược, ẩn bài, xem bài, rút thêm, dừng
+ * Fixes: race-condition lock, dealer BJ check, owner-in-customId
  */
 
 const {
@@ -28,7 +29,6 @@ function createDeck() {
   for (const suit of SUITS)
     for (const rank of RANKS)
       deck.push({ suit, rank });
-  // Fisher-Yates shuffle
   for (let i = deck.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [deck[i], deck[j]] = [deck[j], deck[i]];
@@ -60,8 +60,50 @@ function getBalance(userId) {
   if (!balances.has(userId)) balances.set(userId, 1000);
   return balances.get(userId);
 }
-function addBalance(userId, amount) {
-  balances.set(userId, getBalance(userId) + amount);
+function addBalance(userId, delta) {
+  const cur = getBalance(userId);
+  balances.set(userId, Math.max(0, cur + delta));
+}
+
+// ─── Race-condition guard ──────────────────────────────────────────────────
+// Atomically transitions game from 'playing' → 'resolving'.
+// Returns true if we got the lock (first caller), false otherwise.
+function acquireResolveLock(userId) {
+  const game = games.get(userId);
+  if (!game || game.phase !== 'playing') return false;
+  game.phase = 'resolving';
+  return true;
+}
+
+// ─── Owner helpers ─────────────────────────────────────────────────────────
+// We embed the ownerId in every customId so ownership is verifiable without
+// relying on Discord interactionMetadata (which can be unavailable).
+const SEP = '_';
+
+function makeId(action, userId, extra) {
+  // e.g. "bj_start_123456" or "bj_bet_500_123456"
+  return extra !== undefined
+    ? `bj${SEP}${action}${SEP}${extra}${SEP}${userId}`
+    : `bj${SEP}${action}${SEP}${userId}`;
+}
+
+// Parse a customId. Returns { action, ownerId, extra? } or null.
+function parseId(customId) {
+  if (!customId.startsWith('bj_')) return null;
+  const parts = customId.split(SEP);
+  // parts[0] = 'bj'
+  const action = parts[1];
+  if (!action) return null;
+
+  if (action === 'bet') {
+    // bj_bet_<amount>_<ownerId>
+    const extra = parts[2];
+    const ownerId = parts[3];
+    return { action, extra, ownerId };
+  }
+  // bj_<action>_<ownerId>   (start, cancel, view, hit, stand)
+  const ownerId = parts[2];
+  return { action, ownerId };
 }
 
 // ─── Embeds ────────────────────────────────────────────────────────────────
@@ -71,22 +113,20 @@ function lobbyEmbed(user) {
     .setDescription(
       `**${user.username}** mở phòng Xì Dách!\n\n` +
       `💰 Số dư: **${getBalance(user.id).toLocaleString()}** coins\n\n` +
-      `Nhấn **Bắt đầu** để vào game, **Huỷ** để đóng phòng.`
+      `Nhấn **Bắt đầu** để vào game hoặc **Huỷ** để đóng phòng.`
     )
     .setColor(0x5865F2)
     .setTimestamp();
 }
 
 function betEmbed(user) {
-  const bal = getBalance(user.id);
   return new EmbedBuilder()
     .setTitle('🃏 Xì Dách — Chọn cược')
     .setDescription(
-      `💰 Số dư: **${bal.toLocaleString()}** coins\n\n` +
+      `💰 Số dư: **${getBalance(user.id).toLocaleString()}** coins\n\n` +
       `Chọn mức cược bên dưới:`
     )
-    .setColor(0xFEE75C)
-    .setFooter({ text: 'Mức cược tối đa là 50% số dư của bạn.' });
+    .setColor(0xFEE75C);
 }
 
 function gameEmbed(game) {
@@ -98,23 +138,11 @@ function gameEmbed(game) {
     .setTitle('🃏 Xì Dách — Đang chơi')
     .setColor(0x2B2D31)
     .addFields(
-      {
-        name: '👤 Bài của bạn',
-        value: `${pHand}\n> **Tổng: ${pVal}**`,
-        inline: true,
-      },
-      {
-        name: '🤖 Bài của Bot',
-        value: `${bFirst} \`🂠\`\n> **Tổng: ?**`,
-        inline: true,
-      },
+      { name: '👤 Bài của bạn', value: `${pHand}\n> **Tổng: ${pVal}**`, inline: true },
+      { name: '🤖 Bài của Bot',  value: `${bFirst} \`🂠\`\n> **Tổng: ?**`,     inline: true },
     )
-    .addFields({
-      name: '💰 Cược',
-      value: `**${game.bet.toLocaleString()}** coins`,
-      inline: false,
-    })
-    .setFooter({ text: '👁️ Xem bài để kiểm tra lá bài của bạn.' });
+    .addFields({ name: '💰 Cược', value: `**${game.bet.toLocaleString()}** coins`, inline: false })
+    .setFooter({ text: '👁️ Xem bài để kiểm tra lá bài của bạn (chỉ mình thấy).' });
 }
 
 function resultEmbed(game, result, payout) {
@@ -124,17 +152,17 @@ function resultEmbed(game, result, payout) {
   const bHand = game.botCards.map(cardStr).join(' ');
 
   const colorMap = { win: 0x57F287, blackjack: 0x57F287, botbust: 0x57F287,
-                     lose: 0xED4245, bust: 0xED4245, tie: 0x808080 };
+                     lose: 0xED4245, bust: 0xED4245, dealerbj: 0xED4245,
+                     tie: 0x808080 };
   const textMap  = {
     blackjack: `✨ **BLACKJACK! Bạn thắng!** +${payout.toLocaleString()} coins`,
     win:       `🏆 **Bạn thắng!** +${payout.toLocaleString()} coins`,
     botbust:   `🎉 **Bot quắc! Bạn thắng!** +${payout.toLocaleString()} coins`,
     lose:      `😢 **Bạn thua!** -${game.bet.toLocaleString()} coins`,
     bust:      `💥 **Quắc! Thua rồi.** -${game.bet.toLocaleString()} coins`,
+    dealerbj:  `🃏 **Bot Blackjack! Bạn thua!** -${game.bet.toLocaleString()} coins`,
     tie:       `🤝 **Hòa!** Hoàn trả ${game.bet.toLocaleString()} coins`,
   };
-
-  const newBal = getBalance(game.ownerId);
 
   return new EmbedBuilder()
     .setTitle('🃏 Xì Dách — Kết quả')
@@ -144,56 +172,68 @@ function resultEmbed(game, result, payout) {
       { name: '🤖 Bot', value: `${bHand}\n> **Tổng: ${bVal}**`, inline: true },
     )
     .addFields(
-      { name: '💰 Cược', value: `${game.bet.toLocaleString()} coins`, inline: true },
-      { name: '📊 Kết quả', value: textMap[result] ?? '—', inline: false },
-      { name: '🏦 Số dư mới', value: `**${newBal.toLocaleString()}** coins`, inline: true },
+      { name: '💰 Cược',     value: `${game.bet.toLocaleString()} coins`,                inline: true  },
+      { name: '📊 Kết quả', value: textMap[result] ?? '—',                               inline: false },
+      { name: '🏦 Số dư',   value: `**${getBalance(game.ownerId).toLocaleString()}** coins`, inline: true },
     )
     .setTimestamp();
 }
 
 // ─── Button rows ───────────────────────────────────────────────────────────
-function lobbyRow() {
+const BETS = [100, 500, 1000, 5000, 10000];
+
+function lobbyRow(userId) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('bj_start' ).setLabel('▶️ Bắt đầu').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('bj_cancel').setLabel('❌ Huỷ'    ).setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(makeId('start',  userId)).setLabel('▶️ Bắt đầu').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(makeId('cancel', userId)).setLabel('❌ Huỷ'    ).setStyle(ButtonStyle.Danger),
   );
 }
 
-function betRow(userId) {
+function betRows(userId) {
   const bal  = getBalance(userId);
-  // Offer bet amounts; disable if not enough balance
-  const BETS = [100, 500, 1000, 5000, 10000];
   const btns = BETS.map(b =>
     new ButtonBuilder()
-      .setCustomId(`bj_bet_${b}`)
-      .setLabel(`${b.toLocaleString()}`)
+      .setCustomId(makeId('bet', userId, b))
+      .setLabel(b.toLocaleString())
       .setStyle(ButtonStyle.Primary)
       .setDisabled(bal < b)
   );
-  // Split into two rows (Discord max 5 buttons/row)
-  const row1 = new ActionRowBuilder().addComponents(...btns.slice(0, 5));
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('bj_cancel').setLabel('❌ Huỷ').setStyle(ButtonStyle.Danger),
-  );
-  return [row1, row2];
+  return [
+    new ActionRowBuilder().addComponents(...btns),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(makeId('cancel', userId)).setLabel('❌ Huỷ').setStyle(ButtonStyle.Danger)
+    ),
+  ];
 }
 
-function gameRow() {
+function gameRow(userId) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('bj_view' ).setLabel('👁️ Xem bài' ).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('bj_hit'  ).setLabel('🃏 Rút thêm').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('bj_stand').setLabel('✋ Dừng'    ).setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(makeId('view',  userId)).setLabel('👁️ Xem bài' ).setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(makeId('hit',   userId)).setLabel('🃏 Rút thêm').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(makeId('stand', userId)).setLabel('✋ Dừng'    ).setStyle(ButtonStyle.Success),
   );
 }
 
-// ─── Owner guard ───────────────────────────────────────────────────────────
-/**
- * Returns the userId of whoever ran the original /xidach command.
- * interaction.message.interactionMetadata?.user is set by Discord when the
- * message is the reply to a slash command.
- */
-function getMessageOwner(interaction) {
-  return interaction.message?.interactionMetadata?.user?.id ?? null;
+// ─── Result helpers ────────────────────────────────────────────────────────
+function applyResult(userId, result, bet, payout) {
+  if (result === 'win' || result === 'blackjack' || result === 'botbust') addBalance(userId, payout);
+  else if (result === 'lose' || result === 'bust' || result === 'dealerbj') addBalance(userId, -bet);
+  // tie: no change
+}
+
+// ─── Bot stand logic ───────────────────────────────────────────────────────
+function resolveGame(game) {
+  const pVal = handValue(game.playerCards);
+  while (handValue(game.botCards) < 17) game.botCards.push(game.deck.pop());
+  const bVal = handValue(game.botCards);
+
+  let result, payout = 0;
+  if (bVal > 21)       { result = 'botbust'; payout = game.bet; }
+  else if (pVal > bVal){ result = 'win';     payout = game.bet; }
+  else if (pVal < bVal){ result = 'lose'; }
+  else                 { result = 'tie'; }
+
+  return { result, payout };
 }
 
 // ─── Event handler ─────────────────────────────────────────────────────────
@@ -205,102 +245,96 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // ── /xidach ──────────────────────────────────────────────────────────────
   if (interaction.isChatInputCommand() && interaction.commandName === 'xidach') {
-    // Remove any leftover game for this user
     games.delete(interaction.user.id);
-
     await interaction.reply({
       embeds:     [lobbyEmbed(interaction.user)],
-      components: [lobbyRow()],
+      components: [lobbyRow(interaction.user.id)],
     });
     return;
   }
 
   if (!interaction.isButton()) return;
 
+  const parsed = parseId(interaction.customId);
+  if (!parsed) return; // not our button
+
+  const { action, ownerId, extra } = parsed;
   const userId = interaction.user.id;
 
-  // ── Owner check (for all buttons) ────────────────────────────────────────
-  const ownerId = getMessageOwner(interaction);
+  // ── Owner check — hardcoded in customId ──────────────────────────────────
   if (ownerId && ownerId !== userId) {
-    return interaction.reply({
-      content:   '❌ Đây không phải game của bạn!',
-      ephemeral: true,
-    });
+    return interaction.reply({ content: '❌ Đây không phải game của bạn!', ephemeral: true });
   }
 
   // ── Bắt đầu ──────────────────────────────────────────────────────────────
-  if (interaction.customId === 'bj_start') {
+  if (action === 'start') {
     await interaction.update({
       embeds:     [betEmbed(interaction.user)],
-      components: betRow(userId),
+      components: betRows(userId),
     });
     return;
   }
 
   // ── Huỷ ──────────────────────────────────────────────────────────────────
-  if (interaction.customId === 'bj_cancel') {
+  if (action === 'cancel') {
     games.delete(userId);
     await interaction.update({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle('🃏 Xì Dách')
-          .setDescription('Đã huỷ phòng.')
-          .setColor(0x808080),
-      ],
+      embeds: [new EmbedBuilder().setTitle('🃏 Xì Dách').setDescription('Đã huỷ phòng.').setColor(0x808080)],
       components: [],
     });
     return;
   }
 
   // ── Đặt cược ─────────────────────────────────────────────────────────────
-  if (interaction.customId.startsWith('bj_bet_')) {
-    const bet = parseInt(interaction.customId.replace('bj_bet_', ''), 10);
+  if (action === 'bet') {
+    const bet = parseInt(extra, 10);
     const bal = getBalance(userId);
 
-    if (bal < bet) {
-      return interaction.reply({ content: '❌ Số dư không đủ!', ephemeral: true });
+    if (isNaN(bet) || bal < bet) {
+      return interaction.reply({ content: '❌ Số dư không đủ hoặc mức cược không hợp lệ!', ephemeral: true });
     }
 
     const deck        = createDeck();
     const playerCards = [deck.pop(), deck.pop()];
     const botCards    = [deck.pop(), deck.pop()];
-
-    const game = { phase: 'playing', ownerId: userId, bet, deck, playerCards, botCards };
+    const game        = { phase: 'playing', ownerId: userId, bet, deck, playerCards, botCards };
     games.set(userId, game);
 
-    // Natural blackjack check
-    if (isBlackjack(playerCards)) {
-      if (isBlackjack(botCards)) {
-        // Both blackjack → tie, return bet
-        games.delete(userId);
-        return interaction.update({ embeds: [resultEmbed(game, 'tie', 0)], components: [] });
-      }
-      // Player blackjack → 1.5× payout
+    // ── Natural blackjack checks (immediate resolution) ──────────────────
+    const playerBJ = isBlackjack(playerCards);
+    const botBJ    = isBlackjack(botCards);
+
+    if (playerBJ && botBJ) {
+      // Both blackjack → tie
+      games.delete(userId);
+      return interaction.update({ embeds: [resultEmbed(game, 'tie', 0)], components: [] });
+    }
+    if (playerBJ) {
+      // Player blackjack wins 1.5×
       const payout = Math.floor(bet * 1.5);
       addBalance(userId, payout);
       games.delete(userId);
       return interaction.update({ embeds: [resultEmbed(game, 'blackjack', payout)], components: [] });
     }
+    if (botBJ) {
+      // Dealer blackjack — player loses immediately
+      addBalance(userId, -bet);
+      games.delete(userId);
+      return interaction.update({ embeds: [resultEmbed(game, 'dealerbj', 0)], components: [] });
+    }
 
-    await interaction.update({
-      embeds:     [gameEmbed(game)],
-      components: [gameRow()],
-    });
+    await interaction.update({ embeds: [gameEmbed(game)], components: [gameRow(userId)] });
     return;
   }
 
-  // ── Game actions — require active game ───────────────────────────────────
-  const game = games.get(userId);
-  if (!game || game.phase !== 'playing') {
-    return interaction.reply({ content: '❌ Bạn chưa có game! Dùng `/xidach`', ephemeral: true });
-  }
-
-  // ── Xem bài (ephemeral) ──────────────────────────────────────────────────
-  if (interaction.customId === 'bj_view') {
+  // ── Xem bài (ephemeral, no lock needed) ──────────────────────────────────
+  if (action === 'view') {
+    const game = games.get(userId);
+    if (!game || game.phase === 'resolving') {
+      return interaction.reply({ content: '❌ Không có game đang chạy.', ephemeral: true });
+    }
     const pVal  = handValue(game.playerCards);
     const pHand = game.playerCards.map(cardStr).join(' ');
-    const bFirst = cardStr(game.botCards[0]);
-
     return interaction.reply({
       ephemeral: true,
       embeds: [
@@ -308,11 +342,9 @@ client.on(Events.InteractionCreate, async interaction => {
           .setTitle('👁️ Bài của bạn')
           .setColor(0x5865F2)
           .addFields(
-            { name: '🃏 Lá bài', value: pHand, inline: true },
-            { name: '📊 Tổng điểm', value: `**${pVal}**`, inline: true },
-          )
-          .addFields(
-            { name: '🤖 Lá lộ của Bot', value: bFirst, inline: false },
+            { name: '🃏 Lá bài',    value: pHand,          inline: true },
+            { name: '📊 Tổng điểm', value: `**${pVal}**`,  inline: true },
+            { name: '🤖 Lá lộ Bot', value: cardStr(game.botCards[0]), inline: false },
           )
           .setFooter({ text: 'Chỉ mình bạn thấy tin nhắn này.' }),
       ],
@@ -320,61 +352,48 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 
   // ── Rút thêm ─────────────────────────────────────────────────────────────
-  if (interaction.customId === 'bj_hit') {
+  if (action === 'hit') {
+    // Acquire lock — rejects duplicate/concurrent clicks
+    if (!acquireResolveLock(userId)) {
+      return interaction.reply({ content: '⏳ Đang xử lý...', ephemeral: true });
+    }
+    const game = games.get(userId);
+
     game.playerCards.push(game.deck.pop());
     const pVal = handValue(game.playerCards);
 
-    // Bust
     if (pVal > 21) {
+      // Bust
       addBalance(userId, -game.bet);
       games.delete(userId);
       return interaction.update({ embeds: [resultEmbed(game, 'bust', 0)], components: [] });
     }
 
-    // Auto-stand at 21
     if (pVal === 21) {
-      return resolveStand(interaction, game, userId);
+      // Auto-stand at 21
+      const { result, payout } = resolveGame(game);
+      applyResult(userId, result, game.bet, payout);
+      games.delete(userId);
+      return interaction.update({ embeds: [resultEmbed(game, result, payout)], components: [] });
     }
 
-    return interaction.update({ embeds: [gameEmbed(game)], components: [gameRow()] });
+    // Still in play — release lock (set back to playing)
+    game.phase = 'playing';
+    return interaction.update({ embeds: [gameEmbed(game)], components: [gameRow(userId)] });
   }
 
   // ── Dừng ─────────────────────────────────────────────────────────────────
-  if (interaction.customId === 'bj_stand') {
-    return resolveStand(interaction, game, userId);
+  if (action === 'stand') {
+    if (!acquireResolveLock(userId)) {
+      return interaction.reply({ content: '⏳ Đang xử lý...', ephemeral: true });
+    }
+    const game = games.get(userId);
+    const { result, payout } = resolveGame(game);
+    applyResult(userId, result, game.bet, payout);
+    games.delete(userId);
+    return interaction.update({ embeds: [resultEmbed(game, result, payout)], components: [] });
   }
 });
-
-// ─── Resolve stand/auto-stand ──────────────────────────────────────────────
-async function resolveStand(interaction, game, userId) {
-  const pVal = handValue(game.playerCards);
-
-  // Bot draws until ≥ 17
-  while (handValue(game.botCards) < 17) {
-    game.botCards.push(game.deck.pop());
-  }
-  const bVal = handValue(game.botCards);
-
-  let result, payout = 0;
-  if (bVal > 21) {
-    result = 'botbust';
-    payout = game.bet;
-    addBalance(userId, payout);
-  } else if (pVal > bVal) {
-    result = 'win';
-    payout = game.bet;
-    addBalance(userId, payout);
-  } else if (pVal < bVal) {
-    result = 'lose';
-    addBalance(userId, -game.bet);
-  } else {
-    result = 'tie';
-    // no change
-  }
-
-  games.delete(userId);
-  return interaction.update({ embeds: [resultEmbed(game, result, payout)], components: [] });
-}
 
 // ─── Login ─────────────────────────────────────────────────────────────────
 const token = process.env.DISCORD_TOKEN;
