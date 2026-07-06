@@ -8,7 +8,7 @@
  *   DISCORD_TOKEN=xxx CLIENT_ID=yyy GUILD_ID=zzz node deploy-commands.js
  */
 
-const { REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 
 const token    = process.env.DISCORD_TOKEN;
 const clientId = process.env.CLIENT_ID;
@@ -28,6 +28,11 @@ const commands = [
   new SlashCommandBuilder()
     .setName('diemdanh')
     .setDescription('📅 Điểm danh hàng ngày nhận 20,000 coins')
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('resetphong')
+    .setDescription('🔄 [Admin] Xóa toàn bộ phòng đang bị lỗi trong server')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .toJSON(),
 ];
 

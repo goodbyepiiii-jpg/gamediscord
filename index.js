@@ -342,6 +342,38 @@ async function handleInteraction(interaction) {
     });
   }
 
+  // ── /resetphong ───────────────────────────────────────────────────────────
+  if (interaction.isChatInputCommand() && interaction.commandName === 'resetphong') {
+    // Chỉ Admin mới dùng được (double-check phía server)
+    if (!interaction.memberPermissions?.has('Administrator')) {
+      return interaction.reply({ content: '❌ Bạn cần quyền **Administrator** để dùng lệnh này!', ephemeral: true });
+    }
+
+    const gId = interaction.guildId;
+    const before = rooms.size;
+
+    // Xóa toàn bộ phòng thuộc server này
+    for (const [chId, room] of rooms) {
+      if (room.guildId === gId) rooms.delete(chId);
+    }
+
+    const cleared = before - rooms.size;
+    return interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('🔄 Reset phòng')
+          .setDescription(
+            cleared > 0
+              ? `✅ Đã xóa **${cleared}** phòng bị lỗi trong server.`
+              : '✅ Không có phòng nào đang hoạt động — không cần reset.'
+          )
+          .setColor(cleared > 0 ? 0x57F287 : 0xFEE75C)
+          .setFooter({ text: `Thực hiện bởi ${interaction.user.username}` })
+          .setTimestamp(),
+      ],
+    });
+  }
+
   // ── /xidach ───────────────────────────────────────────────────────────────
   if (interaction.isChatInputCommand() && interaction.commandName === 'xidach') {
     const chId = interaction.channelId;
@@ -349,7 +381,7 @@ async function handleInteraction(interaction) {
       return safeReply(interaction, { content: '❌ Đã có phòng đang chạy trong kênh này!', ephemeral: true });
     }
     const room = {
-      phase: 'lobby', hostId: interaction.user.id, channelId: chId,
+      phase: 'lobby', hostId: interaction.user.id, channelId: chId, guildId: interaction.guildId,
       players: [], deck: [], dealerCards: [], betIndex: 0, turnIndex: 0,
     };
     rooms.set(chId, room);
